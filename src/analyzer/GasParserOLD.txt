@@ -1,0 +1,251 @@
+import { parse } from '@babel/parser';
+import traverse from '@babel/traverse';
+import generate from '@babel/generator';
+import chalk from 'chalk';
+
+class GasParser {
+  constructor() {
+    this.ast = null;
+    this.detectedPatterns = {
+      apiEndpoints: [],
+      triggers: [],
+      spreadsheetOperations: [],
+      driveOperations: [],
+      gmailOperations: [],
+      httpRequests: [],
+      properties: [],
+      uiFunctions: []
+    };
+  }
+  
+  parseGasFile(content, filename) {
+    console.log(chalk.blue(`🔍 Parsing: ${filename}`));
+    
+    try {
+      // Parse the GAS code
+      this.ast = parse(content, {
+        sourceType: 'script',
+        plugins: []
+      });
+      
+      this.analyzeAST();
+      
+      return {
+        filename,
+        ast: this.ast,
+        patterns: this.detectedPatterns,
+        summary: this.generateSummary()
+      };
+    } catch (error) {
+      console.error(chalk.red(`❌ Error parsing ${filename}:`), error.message);
+      return null;
+    }
+  }
+  
+  analyzeAST() {
+    traverse(this.ast, {
+      // Detect function declarations
+      FunctionDeclaration(path) {
+        const functionName = path.node.id?.name || 'anonymous';
+        
+        // Detect API endpoints
+        if (functionName.startsWith('do')) {
+          this.detectedPatterns.apiEndpoints.push({
+            name: functionName,
+            type: functionName.includes('Get') ? 'GET' : 'POST',
+            location: path.node.loc,
+            parameters: path.node.params.map(p => p.name)
+          });
+        }
+        
+        // Detect triggers
+        if (functionName.includes('Trigger') || 
+            functionName === 'onEdit' || 
+            functionName === 'onOpen' ||
+            functionName === 'onFormSubmit') {
+          this.detectedPatterns.triggers.push({
+            name: functionName,
+            type: this.detectTriggerType(functionName),
+            location: path.node.loc
+          });
+        }
+      },
+      
+      // Detect GAS service calls
+      CallExpression(path) {
+        const callee = path.node.callee;
+        
+        // Check for SpreadsheetApp
+        if (callee.object?.name === 'SpreadsheetApp') {
+          this.detectedPatterns.spreadsheetOperations.push({
+            service: 'SpreadsheetApp',
+            method: callee.property?.name,
+            location: path.node.loc
+          });
+        }
+        
+        // Check for DriveApp
+        if (callee.object?.name === 'DriveApp') {
+          this.detectedPatterns.driveOperations.push({
+            service: 'DriveApp',
+            method: callee.property?.name,
+            location: path.node.loc
+          });
+        }
+        
+        // Check for GmailApp
+        if (callee.object?.name === 'GmailApp') {
+          this.detectedPatterns.gmailOperations.push({
+            service: 'GmailApp',
+            method: callee.property?.name,
+            location: path.node.loc
+          });
+        }
+        
+        // Check for UrlFetchApp
+        if (callee.object?.name === 'UrlFetchApp') {
+          this.detectedPatterns.httpRequests.push({
+            service: 'UrlFetchApp',
+            method: callee.property?.name,
+            location: path.node.loc
+          });
+        }
+        
+        // Check for PropertiesService
+        if (callee.object?.name === 'PropertiesService') {
+          this.detectedPatterns.properties.push({
+            service: 'PropertiesService',
+            method: callee.property?.name,
+            location: path.node.loc
+          });
+        }
+      },
+      
+      // Detect HTML Service UI functions
+      MemberExpression(path) {
+        if (path.node.object?.name === 'HtmlService') {
+          this.detectedPatterns.uiFunctions.push({
+            service: 'HtmlService',
+            method: path.node.property?.name,
+            location: path.node.loc
+          });
+        }
+      }
+    }.bind(this));
+  }
+  
+  detectTriggerType(functionName) {
+    if (functionName === 'onEdit' || functionName === 'onOpen') {
+      return 'SPREADSHEET_TRIGGER';
+    } else if (functionName === 'onFormSubmit') {
+      return 'FORM_TRIGGER';
+    } else if (functionName.includes('Time') || functionName.includes('Timer')) {
+      return 'TIME_TRIGGER';
+    } else {
+      return 'UNKNOWN_TRIGGER';
+    }
+  }
+  
+  generateSummary() {
+    return {
+      totalPatterns: Object.values(this.detectedPatterns).reduce((sum, arr) => sum + arr.length, 0),
+      apiEndpoints: this.detectedPatterns.apiEndpoints.length,
+      triggers: this.detectedPatterns.triggers.length,
+      spreadsheetOps: this.detectedPatterns.spreadsheetOperations.length,
+      driveOps: this.detectedPatterns.driveOperations.length,
+      gmailOps: this.detectedPatterns.gmailOperations.length,
+      httpRequests: this.detectedPatterns.httpRequests.length,
+      properties: this.detectedPatterns.properties.length,
+      uiFunctions: this.detectedPatterns.uiFunctions.length
+    };
+  }
+  
+  // Convert GAS code snippet to modern JavaScript
+  convertSnippet(codeSnippet, fromPattern, toPattern) {
+    const conversions = {
+      // SpreadsheetApp conversions
+      'SpreadsheetApp.openById': 'await db.query',
+      'SpreadsheetApp.getActiveSpreadsheet': 'req.session.spreadsheet',
+      'SpreadsheetApp.openByUrl': 'db.connection',
+      'SpreadsheetApp.create': 'CREATE TABLE',
+      'sheet.getDataRange()': 'SELECT * FROM',
+      'sheet.appendRow': 'INSERT INTO',
+      
+      // DriveApp conversions
+      'DriveApp.getFileById': 'fs.readFile',
+      'DriveApp.createFile': 'fs.writeFile',
+      'DriveApp.getFiles': 'fs.readdir',
+      
+      // GmailApp conversions
+      'GmailApp.sendEmail': 'mailer.send',
+      'GmailApp.createDraft': 'mailer.createDraft',
+      
+      // PropertiesService conversions
+      'PropertiesService.getScriptProperties': 'process.env',
+      'PropertiesService.getUserProperties': 'req.session',
+      
+      // UrlFetchApp conversions
+      'UrlFetchApp.fetch': 'axios',
+      
+      // CacheService conversions
+      'CacheService.getScriptCache': 'redis.get',
+      'CacheService.put': 'redis.set',
+      
+      // HTML Service conversions
+      'HtmlService.createHtmlOutput': 'res.render',
+      'HtmlService.createTemplateFromFile': 'import template from'
+    };
+    
+    let converted = codeSnippet;
+    
+    for (const [gasPattern, modernPattern] of Object.entries(conversions)) {
+      if (converted.includes(gasPattern)) {
+        converted = converted.replace(new RegExp(gasPattern, 'g'), modernPattern);
+      }
+    }
+    
+    return converted;
+  }
+  
+  // Extract function definitions
+  extractFunctions() {
+    const functions = [];
+    
+    traverse(this.ast, {
+      FunctionDeclaration(path) {
+        functions.push({
+          name: path.node.id?.name,
+          params: path.node.params.map(p => p.name),
+          body: generate(path.node.body).code,
+          location: path.node.loc
+        });
+      }
+    });
+    
+    return functions;
+  }
+  
+  // Get dependencies between functions
+  analyzeDependencies() {
+    const dependencies = {};
+    
+    traverse(this.ast, {
+      CallExpression(path) {
+        const caller = path.findParent(p => p.isFunctionDeclaration());
+        const callee = path.node.callee.name;
+        
+        if (caller && callee) {
+          const callerName = caller.node.id?.name;
+          if (!dependencies[callerName]) {
+            dependencies[callerName] = [];
+          }
+          dependencies[callerName].push(callee);
+        }
+      }
+    });
+    
+    return dependencies;
+  }
+}
+
+export default GasParser;
